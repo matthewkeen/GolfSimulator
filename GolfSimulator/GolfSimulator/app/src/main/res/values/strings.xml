@@ -1,8 +1,0 @@
-<resources>
-    <string name="app_name">Golf Simulator</string>
-    <string name="camera_permission_required">Camera permission is required to track ball flight</string>
-    <string name="place_ball">Place golf ball in camera view</string>
-    <string name="ball_detected">Ball detected — ready to shoot!</string>
-    <string name="swing_detected">Swing detected! Analyzing…</string>
-    <string name="analyzing_shot">Analyzing shot data…</string>
-</resources>
