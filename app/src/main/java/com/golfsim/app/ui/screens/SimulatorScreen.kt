@@ -27,7 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import com.golfsim.app.models.*
 import com.golfsim.app.ui.GolfSimViewModel
 import com.golfsim.app.ui.Screen
@@ -89,7 +89,8 @@ fun SimulatorScreen(vm: GolfSimViewModel) {
             shotInProgress = shotInProgress,
             onShoot = { vm.startSwingCapture() },
             onSimulate = { vm.simulateShotManually() },
-            onClubSelect = { vm.navigateTo(Screen.CLUB_SELECT) }
+            onClubSelect = { vm.navigateTo(Screen.CLUB_SELECT) },
+            modifier = Modifier.align(Alignment.BottomCenter)
         )
 
         // ─── Shot In Progress overlay ──────────────────────────────────────
@@ -114,7 +115,6 @@ fun TrackingOverlay(ballHistory: List<com.golfsim.app.models.BallPosition>, curr
     Canvas(modifier = Modifier.fillMaxSize()) {
         // Draw trail
         if (ballHistory.size > 1) {
-            val trailPaint = androidx.compose.ui.graphics.drawscope.DrawScope::drawCircle
             ballHistory.takeLast(20).forEachIndexed { i, pos ->
                 val alpha = (i.toFloat() / 20f)
                 drawCircle(
@@ -213,12 +213,12 @@ fun BottomControls(
     shotInProgress: Boolean,
     onShoot: () -> Unit,
     onSimulate: () -> Unit,
-    onClubSelect: () -> Unit
+    onClubSelect: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .align(Alignment.BottomCenter)
     ) {
         // Setup tip
         AnimatedVisibility(!isReady && !shotInProgress) {
