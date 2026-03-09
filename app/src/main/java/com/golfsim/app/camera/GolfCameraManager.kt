@@ -79,6 +79,7 @@ class GolfCameraManager(private val context: Context) {
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .setTargetFrameRate(Range(60, 120))
                 .build()
                 .also { analysis ->
                     analysis.setAnalyzer(cameraExecutor) { imageProxy ->
