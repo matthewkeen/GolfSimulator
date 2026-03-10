@@ -2,12 +2,13 @@ package com.golfsim.app.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
 import android.graphics.PointF
+import android.hardware.camera2.*
 import android.util.Log
+import android.util.Range
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -18,14 +19,25 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.sqrt
+import kotlin.math.*
 
 class GolfCameraManager(private val context: Context) {
 
-    private var cameraProvider: ProcessCameraProvider? = null
-    private var imageAnalyzer: ImageAnalysis? = null
-    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    companion object {
+        private const val TAG = "GolfCamera"
+        private const val TARGET_FPS = 60
+        private const val FRAME_HISTORY_SIZE = 90       // 1.5 seconds at 60fps
+        private const val BRIGHTNESS_THRESHOLD = 200    // White ball brightness floor
+        private const val MIN_BLOB_PIXELS = 8           // Minimum pixels to count as ball
+        private const val MAX_BLOB_PIXELS = 2000        // Maximum (avoids detecting sky/lights)
+        private const val MIN_BALL_RADIUS_PX = 4f
+        private const val MAX_BALL_RADIUS_PX = 120f
+        private const val CIRCULARITY_THRESHOLD = 0.55  // 1.0 = perfect circle
+        private const val MOTION_THRESHOLD_PX = 12f     // px/frame to trigger swing detection
+        private const val MOTION_CONFIRM_FRAMES = 3     // consecutive frames needed to confirm swing
+    }
 
+    // ─── Public state flows ────────────────────────────────────────────────────
     private val _trackingState = MutableStateFlow<TrackingState>(TrackingState.Idle)
     val trackingState: StateFlow<TrackingState> = _trackingState
 
@@ -38,27 +50,48 @@ class GolfCameraManager(private val context: Context) {
     private val _fps = MutableStateFlow(0f)
     val fps: StateFlow<Float> = _fps
 
-    // Ball tracking state
-    private val ballHistory = mutableListOf<BallPosition>()
-    private var lastFrameTime = 0L
-    private var frameCount = 0
-    private var fpsAccumulator = 0f
-    private var isCapturing = false
+    private val _ballRadius = MutableStateFlow(0f)
+    val ballRadius: StateFlow<Float> = _ballRadius
 
-    // Motion detection
-    private var prevGrayFrame: IntArray? = null
-    private var screenWidth = 0
-    private var screenHeight = 0
+    private val _debugInfo = MutableStateFlow("")
+    val debugInfo: StateFlow<String> = _debugInfo
+
+    // ─── Internal state ────────────────────────────────────────────────────────
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var imageAnalyzer: ImageAnalysis? = null
+    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    private val ballHistory = mutableListOf<BallPosition>()
+    private var isCapturing = false
+    private var motionFrameCount = 0
+
+    // FPS tracking
+    private val frameTimestamps = ArrayDeque<Long>(70)
+
+    // Background subtraction — stores last frame's Y data for motion detection
+    private var prevYData: ByteArray? = null
+    private var frameWidth = 0
+    private var frameHeight = 0
+
+    // Kalman-like smoothing for ball position
+    private var kalmanX = 0f
+    private var kalmanY = 0f
+    private var kalmanVx = 0f
+    private var kalmanVy = 0f
+    private var kalmanInitialized = false
+    private val kalmanQ = 0.01f   // process noise
+    private val kalmanR = 5.0f    // measurement noise
 
     sealed class TrackingState {
         object Idle : TrackingState()
         object WaitingForBall : TrackingState()
-        data class BallDetected(val x: Float, val y: Float) : TrackingState()
+        data class BallDetected(val x: Float, val y: Float, val radius: Float, val confidence: Float) : TrackingState()
         object SwingInProgress : TrackingState()
         object AnalyzingShot : TrackingState()
         data class Error(val message: String) : TrackingState()
     }
 
+    // ─── Camera startup ────────────────────────────────────────────────────────
     @SuppressLint("UnsafeOptInUsageError")
     fun startCamera(
         previewView: PreviewView,
@@ -70,177 +103,413 @@ class GolfCameraManager(private val context: Context) {
         cameraProviderFuture.addListener({
             cameraProvider = cameraProviderFuture.get()
 
-            val preview = Preview.Builder()
+            // ── Preview builder with 60fps hint ───────────────────────────────
+            val previewBuilder = Preview.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
-                .build()
+
+            // Force 60fps on Pixel 7 via Camera2 interop
+            Camera2Interop.Extender(previewBuilder)
+                .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    Range(TARGET_FPS, TARGET_FPS)
+                )
+                .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON
+                )
+                .setCaptureRequestOption(
+                    // Disable optical image stabilization for lower latency
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                )
+                .setCaptureRequestOption(
+                    // Electronic IS also off — we want raw speed
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
+                .setCaptureRequestOption(
+                    // Lock focus — autofocus hunting kills frame rate
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                )
+                .setCaptureRequestOption(
+                    // Fixed focus distance — set for ~3m (golf ball distance)
+                    CaptureRequest.LENS_FOCUS_DISTANCE,
+                    0.35f   // diopters — 0.35 ≈ 3 metres
+                )
+                .setCaptureRequestOption(
+                    // Reduce shutter lag — short exposure for fast ball
+                    CaptureRequest.SENSOR_EXPOSURE_TIME,
+                    4_000_000L  // 4ms max exposure (avoids motion blur at 60fps)
+                )
+
+            val preview = previewBuilder.build()
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-            imageAnalyzer = ImageAnalysis.Builder()
+            // ── Image analysis builder with 60fps ─────────────────────────────
+            val analysisBuilder = ImageAnalysis.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also { analysis ->
-                    analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                        processFrame(imageProxy, onBallDetected)
-                    }
-                }
 
-            // Use back camera with highest resolution for Pixel 7
+            Camera2Interop.Extender(analysisBuilder)
+                .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    Range(TARGET_FPS, TARGET_FPS)
+                )
+
+            imageAnalyzer = analysisBuilder.build().also { analysis ->
+                analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    processFrame(imageProxy, onBallDetected)
+                }
+            }
+
             val cameraSelector = CameraSelector.Builder()
                 .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                 .build()
 
             try {
                 cameraProvider?.unbindAll()
-                val camera = cameraProvider?.bindToLifecycle(
+                cameraProvider?.bindToLifecycle(
                     lifecycleOwner, cameraSelector, preview, imageAnalyzer
                 )
-
-                // Enable stabilization for Pixel 7
-                camera?.cameraControl?.setZoomRatio(1.0f)
-
                 _trackingState.value = TrackingState.WaitingForBall
-                Log.d("GolfCamera", "Camera started successfully")
+                Log.d(TAG, "Camera started at ${TARGET_FPS}fps")
             } catch (e: Exception) {
                 _trackingState.value = TrackingState.Error("Camera failed: ${e.message}")
-                Log.e("GolfCamera", "Camera binding failed", e)
+                Log.e(TAG, "Camera binding failed", e)
             }
 
         }, ContextCompat.getMainExecutor(context))
     }
 
+    // ─── Per-frame processing ──────────────────────────────────────────────────
     @SuppressLint("UnsafeOptInUsageError")
-    private fun processFrame(imageProxy: ImageProxy, onBallDetected: ((BallPosition) -> Unit)?) {
+    private fun processFrame(
+        imageProxy: ImageProxy,
+        onBallDetected: ((BallPosition) -> Unit)?
+    ) {
         val now = System.currentTimeMillis()
-
-        // FPS calculation
-        frameCount++
-        if (lastFrameTime > 0) {
-            val delta = now - lastFrameTime
-            fpsAccumulator += 1000f / delta
-            if (frameCount % 30 == 0) {
-                _fps.value = fpsAccumulator / 30f
-                fpsAccumulator = 0f
-            }
-        }
-        lastFrameTime = now
+        updateFps(now)
 
         val image = imageProxy.image
-        if (image != null) {
-            val yBuffer = image.planes[0].buffer
-            val width = imageProxy.width
-            val height = imageProxy.height
+        if (image == null) { imageProxy.close(); return }
 
-            screenWidth = width
-            screenHeight = height
+        val width = imageProxy.width
+        val height = imageProxy.height
+        frameWidth = width
+        frameHeight = height
 
-            val ySize = yBuffer.remaining()
-            val yData = ByteArray(ySize)
-            yBuffer.get(yData)
+        // Extract Y (luminance) plane — fastest possible, no colour conversion needed
+        val yPlane = image.planes[0]
+        val yBuffer = yPlane.buffer
+        val rowStride = yPlane.rowStride
+        val pixelStride = yPlane.pixelStride
 
-            // Convert to grayscale int array for processing
-            val grayData = IntArray(width * height) { yData[it].toInt() and 0xFF }
+        val ySize = yBuffer.remaining()
+        val yData = ByteArray(ySize)
+        yBuffer.get(yData)
 
-            // Detect golf ball (white/bright circular object)
-            val detected = detectBall(grayData, width, height)
+        // ── Multi-stage ball detection ─────────────────────────────────────
+        val detected = detectBallMultiStage(yData, width, height, rowStride, pixelStride)
 
-            if (detected != null) {
-                val ballPos = BallPosition(detected.x, detected.y, now)
-                ballHistory.add(ballPos)
+        if (detected != null) {
+            // Apply Kalman filter to smooth position
+            val smoothed = kalmanUpdate(detected.x, detected.y)
 
-                // Keep only last 60 frames
-                if (ballHistory.size > 60) ballHistory.removeAt(0)
+            val ballPos = BallPosition(smoothed.x, smoothed.y, now)
 
-                _trackingState.value = TrackingState.BallDetected(detected.x, detected.y)
-
-                if (isCapturing) {
-                    onBallDetected?.invoke(ballPos)
-                    _detectedBallPositions.value = ballHistory.toList()
-
-                    // Check if ball is in motion (swing started)
-                    if (ballHistory.size > 5) {
-                        val motion = calculateMotion(ballHistory.takeLast(5))
-                        if (motion > 15f) { // threshold pixels/frame
-                            _trackingState.value = TrackingState.SwingInProgress
-                            _swingDetected.value = true
-                        }
-                    }
+            if (isCapturing) {
+                synchronized(ballHistory) {
+                    ballHistory.add(ballPos)
+                    if (ballHistory.size > FRAME_HISTORY_SIZE) ballHistory.removeAt(0)
                 }
+                _detectedBallPositions.value = ballHistory.toList()
+                onBallDetected?.invoke(ballPos)
+                checkForSwing()
+            }
 
-                prevGrayFrame = grayData
-            } else if (!isCapturing) {
+            _ballRadius.value = detected.radius
+            _trackingState.value = TrackingState.BallDetected(
+                smoothed.x, smoothed.y, detected.radius, detected.confidence
+            )
+        } else {
+            // Ball lost — reset Kalman
+            kalmanInitialized = false
+            if (!isCapturing) {
                 _trackingState.value = TrackingState.WaitingForBall
             }
         }
 
+        prevYData = yData
         imageProxy.close()
     }
 
+    // ─── Multi-stage ball detection algorithm ──────────────────────────────────
     /**
-     * Detect white golf ball using brightness thresholding and blob analysis.
-     * Works best when ball is placed on tee against darker background.
+     * Stage 1: Brightness threshold — find all pixels above threshold
+     * Stage 2: Connected component labeling — group adjacent bright pixels into blobs
+     * Stage 3: Circularity filter — reject non-circular blobs (lights, reflections)
+     * Stage 4: Size filter — reject blobs too small or too large
+     * Stage 5: Motion validation — prefer blobs that moved from last frame
      */
-    private fun detectBall(grayData: IntArray, width: Int, height: Int): PointF? {
-        val threshold = 210  // High brightness = white ball
+    private data class Blob(
+        val cx: Float,
+        val cy: Float,
+        val radius: Float,
+        val pixelCount: Int,
+        val circularity: Float,
+        val confidence: Float
+    )
 
-        // Find bright regions (potential ball pixels)
-        val brightPixels = mutableListOf<Pair<Int, Int>>()
+    private fun detectBallMultiStage(
+        yData: ByteArray,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int
+    ): Blob? {
 
-        // Sample every 3rd pixel for performance
-        for (y in (height / 3)..(2 * height / 3) step 3) {
-            for (x in (width / 5)..(4 * width / 5) step 3) {
-                val idx = y * width + x
-                if (idx < grayData.size && grayData[idx] > threshold) {
-                    brightPixels.add(Pair(x, y))
+        // ── Stage 1: threshold pass — build bright pixel map ──────────────
+        // Only scan the central 80% of the frame (ignore top/bottom edges)
+        val yStart = height / 10
+        val yEnd = height * 9 / 10
+        val xStart = width / 10
+        val xEnd = width * 9 / 10
+
+        // Downsample by 2 for speed (still 30fps equivalent precision)
+        val step = 2
+        val brightMap = BooleanArray(width * height)
+
+        for (y in yStart until yEnd step step) {
+            for (x in xStart until xEnd step step) {
+                val idx = y * rowStride + x * pixelStride
+                if (idx < yData.size) {
+                    val luma = yData[idx].toInt() and 0xFF
+                    if (luma >= BRIGHTNESS_THRESHOLD) {
+                        brightMap[y * width + x] = true
+                    }
                 }
             }
         }
 
-        if (brightPixels.size < 10) return null
+        // ── Stage 2: simple blob detection via flood fill ─────────────────
+        val visited = BooleanArray(width * height)
+        val blobs = mutableListOf<Blob>()
 
-        // Find centroid of bright pixels cluster
-        val centerX = brightPixels.map { it.first }.average().toFloat()
-        val centerY = brightPixels.map { it.second }.average().toFloat()
+        for (y in yStart until yEnd step step) {
+            for (x in xStart until xEnd step step) {
+                val idx = y * width + x
+                if (brightMap[idx] && !visited[idx]) {
+                    val blob = floodFill(brightMap, visited, x, y, width, height, step)
+                    if (blob != null) blobs.add(blob)
+                }
+            }
+        }
 
-        // Verify it's roughly circular (within reasonable spread)
-        val maxDist = brightPixels.maxOfOrNull { p ->
-            sqrt(((p.first - centerX) * (p.first - centerX) +
-                  (p.second - centerY) * (p.second - centerY)).toDouble()).toFloat()
-        } ?: return null
+        if (blobs.isEmpty()) return null
 
-        // Ball should have reasonable size (not too big or too small)
-        if (maxDist < 5 || maxDist > 80) return null
+        // ── Stage 3 & 4: filter by circularity and size ───────────────────
+        val validBlobs = blobs.filter {
+            it.circularity >= CIRCULARITY_THRESHOLD &&
+            it.radius >= MIN_BALL_RADIUS_PX &&
+            it.radius <= MAX_BALL_RADIUS_PX &&
+            it.pixelCount >= MIN_BLOB_PIXELS &&
+            it.pixelCount <= MAX_BLOB_PIXELS
+        }
 
-        return PointF(centerX, centerY)
+        if (validBlobs.isEmpty()) return null
+
+        // ── Stage 5: motion validation — prefer blob closest to predicted pos ──
+        val prev = prevYData
+        return if (prev != null && kalmanInitialized) {
+            // Prefer blob closest to where we predict ball should be
+            val predictedX = kalmanX + kalmanVx
+            val predictedY = kalmanY + kalmanVy
+            validBlobs.minByOrNull { blob ->
+                val dx = blob.cx - predictedX
+                val dy = blob.cy - predictedY
+                sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+            }
+        } else {
+            // No history — pick the most circular blob near center of frame
+            val cx = width / 2f
+            val cy = height / 2f
+            validBlobs.maxByOrNull { blob ->
+                // Score = circularity - (distance from center / frame diagonal)
+                val dx = blob.cx - cx
+                val dy = blob.cy - cy
+                val dist = sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+                val diagonal = sqrt((width * width + height * height).toDouble()).toFloat()
+                blob.circularity - (dist / diagonal) * 0.5f
+            }
+        }
     }
 
-    private fun calculateMotion(positions: List<BallPosition>): Float {
-        if (positions.size < 2) return 0f
+    /**
+     * Flood fill a bright blob, computing its centroid, radius, and circularity.
+     */
+    private fun floodFill(
+        brightMap: BooleanArray,
+        visited: BooleanArray,
+        startX: Int,
+        startY: Int,
+        width: Int,
+        height: Int,
+        step: Int
+    ): Blob? {
+        val stack = ArrayDeque<Int>()
+        val pixels = mutableListOf<Pair<Int, Int>>()
+
+        val startIdx = startY * width + startX
+        stack.addLast(startIdx)
+        visited[startIdx] = true
+
+        var iterations = 0
+        while (stack.isNotEmpty() && iterations < MAX_BLOB_PIXELS * 2) {
+            val idx = stack.removeLast()
+            val px = idx % width
+            val py = idx / width
+            pixels.add(Pair(px, py))
+            iterations++
+
+            // Check 4-connected neighbours (at step size)
+            val neighbours = arrayOf(
+                Pair(px + step, py),
+                Pair(px - step, py),
+                Pair(px, py + step),
+                Pair(px, py - step)
+            )
+            for ((nx, ny) in neighbours) {
+                if (nx in 0 until width && ny in 0 until height) {
+                    val nIdx = ny * width + nx
+                    if (brightMap[nIdx] && !visited[nIdx]) {
+                        visited[nIdx] = true
+                        stack.addLast(nIdx)
+                    }
+                }
+            }
+        }
+
+        if (pixels.size < MIN_BLOB_PIXELS) return null
+
+        // Centroid
+        val cx = pixels.map { it.first }.average().toFloat()
+        val cy = pixels.map { it.second }.average().toFloat()
+
+        // Bounding box
+        val minX = pixels.minOf { it.first }.toFloat()
+        val maxX = pixels.maxOf { it.first }.toFloat()
+        val minY = pixels.minOf { it.second }.toFloat()
+        val maxY = pixels.maxOf { it.second }.toFloat()
+        val bboxW = maxX - minX
+        val bboxH = maxY - minY
+
+        // Approximate radius from bounding box
+        val radius = (bboxW + bboxH) / 4f
+
+        // Circularity = 4π * area / perimeter²
+        // For a blob: area ≈ pixelCount * step², perimeter ≈ 2π * radius
+        val area = pixels.size.toFloat() * step * step
+        val expectedArea = PI.toFloat() * radius * radius
+        val circularity = (area / expectedArea).coerceIn(0f, 1f)
+
+        // Confidence score combining circularity and size appropriateness
+        val idealRadius = 20f  // typical golf ball at 10 feet
+        val sizeScore = 1f - (abs(radius - idealRadius) / idealRadius).coerceIn(0f, 1f)
+        val confidence = (circularity * 0.7f + sizeScore * 0.3f).coerceIn(0f, 1f)
+
+        return Blob(cx, cy, radius, pixels.size, circularity, confidence)
+    }
+
+    // ─── Kalman filter (1D per axis, constant velocity model) ─────────────────
+    private fun kalmanUpdate(measX: Float, measY: Float): PointF {
+        if (!kalmanInitialized) {
+            kalmanX = measX
+            kalmanY = measY
+            kalmanVx = 0f
+            kalmanVy = 0f
+            kalmanInitialized = true
+            return PointF(measX, measY)
+        }
+
+        // Predict
+        val predX = kalmanX + kalmanVx
+        val predY = kalmanY + kalmanVy
+
+        // Update (simplified scalar Kalman gain)
+        val gain = kalmanQ / (kalmanQ + kalmanR)
+        val newX = predX + gain * (measX - predX)
+        val newY = predY + gain * (measY - predY)
+
+        // Update velocity
+        kalmanVx = (newX - kalmanX) * 0.8f  // 0.8 = velocity decay
+        kalmanVy = (newY - kalmanY) * 0.8f
+
+        kalmanX = newX
+        kalmanY = newY
+
+        return PointF(newX, newY)
+    }
+
+    // ─── Swing detection ───────────────────────────────────────────────────────
+    private fun checkForSwing() {
+        val history = synchronized(ballHistory) { ballHistory.toList() }
+        if (history.size < 4) return
+
+        // Calculate instantaneous speed over last 4 frames
+        val recent = history.takeLast(4)
         var totalMotion = 0f
-        for (i in 1 until positions.size) {
-            val dx = positions[i].x - positions[i - 1].x
-            val dy = positions[i].y - positions[i - 1].y
+        for (i in 1 until recent.size) {
+            val dx = recent[i].x - recent[i - 1].x
+            val dy = recent[i].y - recent[i - 1].y
             totalMotion += sqrt((dx * dx + dy * dy).toDouble()).toFloat()
         }
-        return totalMotion / (positions.size - 1)
+        val avgMotion = totalMotion / (recent.size - 1)
+
+        if (avgMotion > MOTION_THRESHOLD_PX) {
+            motionFrameCount++
+            if (motionFrameCount >= MOTION_CONFIRM_FRAMES && !_swingDetected.value) {
+                Log.d(TAG, "Swing detected! avg motion = $avgMotion px/frame")
+                _swingDetected.value = true
+                _trackingState.value = TrackingState.SwingInProgress
+            }
+        } else {
+            motionFrameCount = 0
+        }
     }
 
+    // ─── FPS counter ───────────────────────────────────────────────────────────
+    private fun updateFps(now: Long) {
+        frameTimestamps.addLast(now)
+        // Remove timestamps older than 1 second
+        while (frameTimestamps.isNotEmpty() && now - frameTimestamps.first() > 1000L) {
+            frameTimestamps.removeFirst()
+        }
+        _fps.value = frameTimestamps.size.toFloat()
+    }
+
+    // ─── Public controls ───────────────────────────────────────────────────────
     fun startCapturing() {
-        isCapturing = true
-        ballHistory.clear()
+        synchronized(ballHistory) { ballHistory.clear() }
+        motionFrameCount = 0
+        kalmanInitialized = false
         _swingDetected.value = false
+        isCapturing = true
         _trackingState.value = TrackingState.WaitingForBall
+        Log.d(TAG, "Capturing started")
     }
 
     fun stopCapturing(): List<BallPosition> {
         isCapturing = false
         _trackingState.value = TrackingState.AnalyzingShot
-        return ballHistory.toList()
+        return synchronized(ballHistory) { ballHistory.toList() }
     }
 
     fun resetTracking() {
-        ballHistory.clear()
+        synchronized(ballHistory) { ballHistory.clear() }
+        motionFrameCount = 0
+        kalmanInitialized = false
         _swingDetected.value = false
         _detectedBallPositions.value = emptyList()
         _trackingState.value = TrackingState.WaitingForBall
