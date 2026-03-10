@@ -356,7 +356,8 @@ class GolfCameraManager(private val context: Context) {
         val centX = (if (sumW > 0) sumX / sumW else startX.toDouble()).toFloat()
         val centY = (if (sumW > 0) sumY / sumW else startY.toDouble()).toFloat()
         val radius = ((maxX - minX + maxY - minY) / 4f).coerceAtLeast(1f)
-        val area = count.toFloat()
+        // count is subsampled by step in both X and Y, so multiply by step² to approximate true area
+        val area = count.toFloat() * (step * step)
         val perim = 2f * PI.toFloat() * radius
         val circularity = ((4f * PI.toFloat() * area) / (perim * perim)).coerceIn(0f, 1f)
         val avgLuma = (sumLuma / count).toFloat()
