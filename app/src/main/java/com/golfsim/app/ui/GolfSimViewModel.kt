@@ -140,22 +140,34 @@ class GolfSimViewModel(application: Application) : AndroidViewModel(application)
             val captured = cameraManager.stopCapturing()
             _shotInProgress.value = false
 
-            val metrics = if (captured.size >= 3) {
-                BallPhysicsEngine.generateMetricsFromTracking(
-                    ballPositions = captured,
-                    club = _selectedClub.value,
-                    screenWidthPx = 1080,
-                    screenHeightPx = 2400
-                )
-            } else {
-                BallPhysicsEngine.generateDefaultMetrics(_selectedClub.value)
+            // Prefer the rich ShotDataSnapshot from the new camera manager
+            val snapshot = cameraManager.shotSnapshot.value
+
+            val metrics: SwingMetrics = when {
+                snapshot != null && snapshot.ballSpeedMph > 5.0 -> {
+                    // Primary path: full launch-monitor data from camera
+                    BallPhysicsEngine.metricsFromSnapshot(snapshot, _selectedClub.value)
+                }
+                captured.size >= 3 -> {
+                    // Fallback: raw pixel positions
+                    BallPhysicsEngine.generateMetricsFromTracking(
+                        ballPositions = captured,
+                        club          = _selectedClub.value,
+                        screenWidthPx = 1280,
+                        screenHeightPx = 720
+                    )
+                }
+                else -> {
+                    // Last resort: physics-based simulation
+                    BallPhysicsEngine.generateDefaultMetrics(_selectedClub.value)
+                }
             }
 
             val result = BallPhysicsEngine.simulate(metrics, _selectedClub.value)
             _lastSwingMetrics.value = metrics
-            _lastShotResult.value = result
-            _showShotResult.value = true
-            _sessionShots.value = _sessionShots.value + result
+            _lastShotResult.value   = result
+            _showShotResult.value   = true
+            _sessionShots.value     = _sessionShots.value + result
         }
     }
 
