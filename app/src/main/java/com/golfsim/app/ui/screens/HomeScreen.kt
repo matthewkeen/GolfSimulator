@@ -209,16 +209,12 @@ fun RecentRoundCard(round: com.golfsim.app.models.RoundScore) {
             Column {
                 Text(round.courseId, fontWeight = FontWeight.Bold, color = Color.White, fontSize = 14.sp)
                 Text(
-                    java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US).format(java.util.Date(round.date)),
+                    formatRoundDate(round.date),
                     color = Color(0xFF9E9E9E), fontSize = 12.sp
                 )
             }
             Column(horizontalAlignment = Alignment.End) {
-                val scoreColor = when {
-                    round.relativeToPar < 0 -> Color(0xFF66BB6A)
-                    round.relativeToPar == 0 -> GoldAccent
-                    else -> Color(0xFFEF5350)
-                }
+                val scoreColor = scoreColor(round.relativeToPar)
                 Text(
                     "${if (round.relativeToPar >= 0) "+" else ""}${round.relativeToPar}",
                     color = scoreColor,

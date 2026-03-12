@@ -232,7 +232,7 @@ fun ScoreHistoryChart(rounds: List<com.golfsim.app.models.RoundScore>) {
                     Column {
                         Text(round.courseId.take(22), fontSize = 13.sp, color = Color.White)
                         Text(
-                            java.text.SimpleDateFormat("MMM d", java.util.Locale.US).format(java.util.Date(round.date)),
+                            formatRoundDate(round.date, "MMM d"),
                             fontSize = 11.sp, color = Color(0xFF9E9E9E)
                         )
                     }

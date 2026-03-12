@@ -93,19 +93,14 @@ fun RoundSummaryCard(round: RoundScore, onClick: () -> Unit) {
                     Text(round.courseId, fontWeight = FontWeight.Bold, color = Color.White, fontSize = 16.sp)
                     Text(round.playerName, color = Color(0xFF9E9E9E), fontSize = 13.sp)
                     Text(
-                        java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(round.date)),
+                        formatRoundDate(round.date, "MMMM d, yyyy"),
                         color = Color(0xFF9E9E9E), fontSize = 12.sp
                     )
-                }
-                val scoreColor = when {
-                    round.relativeToPar < 0 -> GolfGreenLight
-                    round.relativeToPar == 0 -> GoldAccent
-                    else -> Color(0xFFEF5350)
                 }
                 Column(horizontalAlignment = Alignment.End) {
                     Text(
                         "${if (round.relativeToPar >= 0) "+" else ""}${round.relativeToPar}",
-                        fontSize = 28.sp, fontWeight = FontWeight.Black, color = scoreColor
+                        fontSize = 28.sp, fontWeight = FontWeight.Black, color = scoreColor(round.relativeToPar)
                     )
                     Text("${round.totalStrokes} strokes", fontSize = 12.sp, color = Color(0xFF9E9E9E))
                 }
@@ -164,13 +159,8 @@ fun RoundDetailScreen(round: RoundScore, onBack: () -> Unit) {
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val scoreColor = when {
-                        round.relativeToPar < 0 -> GolfGreenLight
-                        round.relativeToPar == 0 -> GoldAccent
-                        else -> Color(0xFFEF5350)
-                    }
                     BigStatSimple("${round.totalStrokes}", "Total", Color.White)
-                    BigStatSimple("${if (round.relativeToPar >= 0) "+" else ""}${round.relativeToPar}", "vs Par", scoreColor)
+                    BigStatSimple("${if (round.relativeToPar >= 0) "+" else ""}${round.relativeToPar}", "vs Par", scoreColor(round.relativeToPar))
                     BigStatSimple("${round.totalPutts}", "Putts", SkyBlue)
                     BigStatSimple("${round.fairwaysHit}", "FIR", GolfGreenLight)
                     BigStatSimple("${round.greensInRegulation}", "GIR", GolfGreenLight)

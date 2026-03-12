@@ -723,9 +723,9 @@ fun AdvancedSliders(profile: CalibrationProfile, onProfileChange: (CalibrationPr
 @Composable
 fun SetupTipsRow() {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        CalibSetupTip("💡", "Good lighting makes detection much more reliable")
-        CalibSetupTip("⚪", "Use a white golf ball for best contrast")
-        CalibSetupTip("📐", "Position camera 8–12 ft from the tee, side-on")
+        SetupTip("💡", "Good lighting makes detection much more reliable")
+        SetupTip("⚪", "Use a white golf ball for best contrast")
+        SetupTip("📐", "Position camera 8–12 ft from the tee, side-on")
     }
 }
 
@@ -780,14 +780,6 @@ fun SummaryRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, fontSize = 13.sp, color = Color(0xFF9E9E9E))
         Text(value, fontSize = 13.sp, color = Color.White, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-fun CalibSetupTip(icon: String, text: String) {
-    Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(icon, fontSize = 15.sp)
-        Text(text, fontSize = 13.sp, color = Color(0xFFB0BEC5))
     }
 }
 

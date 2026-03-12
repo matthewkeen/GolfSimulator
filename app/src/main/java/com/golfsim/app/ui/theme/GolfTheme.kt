@@ -16,6 +16,19 @@ val WaterHazard = Color(0xFF1976D2)
 val RoughGreen = Color(0xFF388E3C)
 val BallWhite = Color(0xFFF5F5F5)
 val HUDBackground = Color(0xCC000000)
+val ErrorRed = Color(0xFFEF5350)
+val SubtleGray = Color(0xFF9E9E9E)
+
+/** Returns a color indicating score performance relative to par. */
+fun scoreColor(relativeToPar: Int): Color = when {
+    relativeToPar < 0 -> GolfGreenLight
+    relativeToPar == 0 -> GoldAccent
+    else -> ErrorRed
+}
+
+/** Formats a round date timestamp using the given pattern (defaults to "MMM d, yyyy"). */
+fun formatRoundDate(timestamp: Long, pattern: String = "MMM d, yyyy"): String =
+    java.text.SimpleDateFormat(pattern, java.util.Locale.US).format(java.util.Date(timestamp))
 
 val DarkBackground = Color(0xFF0D1B0D)
 val DarkSurface = Color(0xFF1A2E1A)
